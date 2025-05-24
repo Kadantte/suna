@@ -8,11 +8,11 @@ import React, {
   useImperativeHandle,
 } from 'react';
 import { motion } from 'framer-motion';
-import { Loader2 } from 'lucide-react';
+import { Loader2, X } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { handleFiles } from './file-upload-handler';
 import { MessageInput } from './message-input';
-import { UploadedFilesDisplay } from './uploaded-file-display';
+import { AttachmentGroup } from '../attachment-group';
 import { useModelSelection } from './_use-model-selection';
 
 export interface ChatInputHandles {
@@ -42,6 +42,8 @@ export interface UploadedFile {
   name: string;
   path: string;
   size: number;
+  type: string;
+  localUrl?: string;
 }
 
 export const ChatInput = forwardRef<ChatInputHandles, ChatInputProps>(
@@ -79,6 +81,8 @@ export const ChatInput = forwardRef<ChatInputHandles, ChatInputProps>(
       subscriptionStatus,
       allModels: modelOptions,
       canAccessModel,
+      getActualModelId,
+      refreshCustomModels,
     } = useModelSelection();
 
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -118,10 +122,10 @@ export const ChatInput = forwardRef<ChatInputHandles, ChatInputProps>(
         message = message ? `${message}\n\n${fileInfo}` : fileInfo;
       }
 
-      let baseModelName = selectedModel;
+      let baseModelName = getActualModelId(selectedModel);
       let thinkingEnabled = false;
       if (selectedModel.endsWith('-thinking')) {
-        baseModelName = selectedModel.replace(/-thinking$/, '');
+        baseModelName = getActualModelId(selectedModel.replace(/-thinking$/, ''));
         thinkingEnabled = true;
       }
 
@@ -147,6 +151,11 @@ export const ChatInput = forwardRef<ChatInputHandles, ChatInputProps>(
     };
 
     const removeUploadedFile = (index: number) => {
+      const fileToRemove = uploadedFiles[index];
+      if (fileToRemove.localUrl) {
+        URL.revokeObjectURL(fileToRemove.localUrl);
+      }
+
       setUploadedFiles((prev) => prev.filter((_, i) => i !== index));
       if (!sandboxId && pendingFiles.length > index) {
         setPendingFiles((prev) => prev.filter((_, i) => i !== index));
@@ -189,11 +198,14 @@ export const ChatInput = forwardRef<ChatInputHandles, ChatInputProps>(
           }}
         >
           <div className="w-full text-sm flex flex-col justify-between items-start rounded-lg">
-            <CardContent className="w-full p-1.5 pb-2 pt-3 bg-sidebar rounded-2xl border">
-              <UploadedFilesDisplay
-                uploadedFiles={uploadedFiles}
+            <CardContent className="w-full p-1.5 pb-2 bg-sidebar rounded-2xl border">
+              <AttachmentGroup
+                files={uploadedFiles || []}
                 sandboxId={sandboxId}
-                onRemoveFile={removeUploadedFile}
+                onRemove={removeUploadedFile}
+                layout="inline"
+                maxHeight="216px"
+                showPreviews={true}
               />
 
               <MessageInput
@@ -222,6 +234,7 @@ export const ChatInput = forwardRef<ChatInputHandles, ChatInputProps>(
                 modelOptions={modelOptions}
                 subscriptionStatus={subscriptionStatus}
                 canAccessModel={canAccessModel}
+                refreshCustomModels={refreshCustomModels}
               />
             </CardContent>
           </div>

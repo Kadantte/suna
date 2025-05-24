@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   streamAgent,
   getAgentStatus,
@@ -72,7 +72,9 @@ export function useAgentStream(
 ): UseAgentStreamResult {
   const [agentRunId, setAgentRunId] = useState<string | null>(null);
   const [status, setStatus] = useState<string>('idle');
-  const [textContent, setTextContent] = useState<string>('');
+  const [textContent, setTextContent] = useState<
+    { content: string; sequence?: number }[]
+  >([]);
   const [toolCall, setToolCall] = useState<ParsedContent | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -81,6 +83,12 @@ export function useAgentStream(
   const currentRunIdRef = useRef<string | null>(null); // Ref to track the run ID being processed
   const threadIdRef = useRef(threadId); // Ref to hold the current threadId
   const setMessagesRef = useRef(setMessages); // Ref to hold the setMessages function
+
+  const orderedTextContent = useMemo(() => {
+    return textContent
+      .sort((a, b) => a.sequence - b.sequence)
+      .reduce((acc, curr) => acc + curr.content, '');
+  }, [textContent]);
 
   // Update refs if threadId or setMessages changes
   useEffect(() => {
@@ -148,7 +156,7 @@ export function useAgentStream(
       }
 
       // Reset streaming-specific state
-      setTextContent('');
+      setTextContent([]);
       setToolCall(null);
 
       // Update status and clear run ID
@@ -252,6 +260,21 @@ export function useAgentStream(
         return;
       }
 
+      // --- Check for error messages first ---
+      try {
+        const jsonData = JSON.parse(processedData);
+        if (jsonData.status === 'error') {
+          console.error('[useAgentStream] Received error status message:', jsonData);
+          const errorMessage = jsonData.message || 'Unknown error occurred';
+          setError(errorMessage);
+          toast.error(errorMessage, { duration: 15000 });
+          callbacks.onError?.(errorMessage);
+          return;
+        }
+      } catch (jsonError) {
+        // Not JSON or could not parse as JSON, continue processing
+      }
+
       // --- Process JSON messages ---
       const message: UnifiedMessage = safeJsonParse(processedData, null);
       if (!message) {
@@ -273,14 +296,21 @@ export function useAgentStream(
 
       switch (message.type) {
         case 'assistant':
+          console.log('[useAgentStream] test a:', parsedContent.content);
+          console.log('[useAgentStream] test a1:', parsedMetadata);
           if (
             parsedMetadata.stream_status === 'chunk' &&
             parsedContent.content
           ) {
-            setTextContent((prev) => prev + parsedContent.content);
+            setTextContent((prev) => {
+              return prev.concat({
+                sequence: message.sequence,
+                content: parsedContent.content,
+              });
+            });
             callbacks.onAssistantChunk?.({ content: parsedContent.content });
           } else if (parsedMetadata.stream_status === 'complete') {
-            setTextContent('');
+            setTextContent([]);
             setToolCall(null);
             if (message.message_id) callbacks.onMessage(message);
           } else if (!parsedMetadata.stream_status) {
@@ -379,6 +409,9 @@ export function useAgentStream(
 
       console.error('[useAgentStream] Streaming error:', errorMessage, err);
       setError(errorMessage);
+      
+      // Show error toast with longer duration
+      toast.error(errorMessage, { duration: 15000 });
 
       const runId = currentRunIdRef.current;
       if (!runId) {
@@ -389,53 +422,6 @@ export function useAgentStream(
         return;
       }
 
-      // Check agent status immediately after an error
-      getAgentStatus(runId)
-        .then((agentStatus) => {
-          if (!isMountedRef.current) return; // Check mount status again after async call
-
-          if (agentStatus.status === 'running') {
-            console.warn(
-              `[useAgentStream] Stream error for ${runId}, but agent is still running. Finalizing with error.`,
-            );
-            finalizeStream('error', runId); // Stream failed, even if agent might still be running backend-side
-            toast.warning('Stream interrupted. Agent might still be running.');
-          } else {
-            // Map backend terminal status to hook terminal status
-            const finalStatus = mapAgentStatus(agentStatus.status);
-            console.log(
-              `[useAgentStream] Stream error for ${runId}, agent status is ${agentStatus.status}. Finalizing stream as ${finalStatus}.`,
-            );
-            finalizeStream(finalStatus, runId);
-          }
-        })
-        .catch((statusError) => {
-          if (!isMountedRef.current) return;
-
-          const statusErrorMessage =
-            statusError instanceof Error
-              ? statusError.message
-              : String(statusError);
-          console.error(
-            `[useAgentStream] Error checking agent status for ${runId} after stream error: ${statusErrorMessage}`,
-          );
-
-          const isNotFoundError =
-            statusErrorMessage.includes('not found') ||
-            statusErrorMessage.includes('404') ||
-            statusErrorMessage.includes('does not exist');
-
-          if (isNotFoundError) {
-            console.log(
-              `[useAgentStream] Agent run ${runId} not found after stream error. Finalizing.`,
-            );
-            // Revert to agent_not_running for this specific case
-            finalizeStream('agent_not_running', runId);
-          } else {
-            // For other status check errors, finalize with the original stream error
-            finalizeStream('error', runId);
-          }
-        });
     },
     [finalizeStream],
   );
@@ -530,7 +516,7 @@ export function useAgentStream(
       }
       // Reset state on unmount if needed, though finalizeStream should handle most cases
       setStatus('idle');
-      setTextContent('');
+      setTextContent([]);
       setToolCall(null);
       setError(null);
       setAgentRunId(null);
@@ -557,7 +543,7 @@ export function useAgentStream(
       }
 
       // Reset state before starting
-      setTextContent('');
+      setTextContent([]);
       setToolCall(null);
       setError(null);
       updateStatus('connecting');
@@ -645,7 +631,7 @@ export function useAgentStream(
 
   return {
     status,
-    textContent,
+    textContent: orderedTextContent,
     toolCall,
     error,
     agentRunId,

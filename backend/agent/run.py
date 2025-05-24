@@ -8,7 +8,7 @@ from typing import Optional
 from agent.tools.message_tool import MessageTool
 from agent.tools.sb_deploy_tool import SandboxDeployTool
 from agent.tools.sb_expose_tool import SandboxExposeTool
-from agent.tools.web_search_tool import WebSearchTool
+from agent.tools.web_search_tool import SandboxWebSearchTool
 from dotenv import load_dotenv
 from utils.config import config
 
@@ -19,10 +19,14 @@ from agent.tools.sb_files_tool import SandboxFilesTool
 from agent.tools.sb_browser_tool import SandboxBrowserTool
 from agent.tools.data_providers_tool import DataProvidersTool
 from agent.prompt import get_system_prompt
-from utils import logger
+from utils.logger import logger
 from utils.auth_utils import get_account_id_from_thread
 from services.billing import check_billing_status
 from agent.tools.sb_vision_tool import SandboxVisionTool
+from services.langfuse import langfuse
+from langfuse.client import StatefulTraceClient
+from services.langfuse import langfuse
+from agent.gemini_prompt import get_gemini_system_prompt
 
 load_dotenv()
 
@@ -32,16 +36,19 @@ async def run_agent(
     stream: bool,
     thread_manager: Optional[ThreadManager] = None,
     native_max_auto_continues: int = 25,
-    max_iterations: int = 150,
+    max_iterations: int = 100,
     model_name: str = "anthropic/claude-3-7-sonnet-latest",
     enable_thinking: Optional[bool] = False,
     reasoning_effort: Optional[str] = 'low',
-    enable_context_manager: bool = True
+    enable_context_manager: bool = True,
+    trace: Optional[StatefulTraceClient] = None
 ):
     """Run the development agent with specified configuration."""
-    print(f"🚀 Starting agent with model: {model_name}")
+    logger.info(f"🚀 Starting agent with model: {model_name}")
 
-    thread_manager = ThreadManager()
+    if not trace:
+        trace = langfuse.trace(name="run_agent", session_id=thread_id, metadata={"project_id": project_id})
+    thread_manager = ThreadManager(trace=trace)
 
     client = await thread_manager.db.client
 
@@ -68,25 +75,42 @@ async def run_agent(
     thread_manager.add_tool(SandboxDeployTool, project_id=project_id, thread_manager=thread_manager)
     thread_manager.add_tool(SandboxExposeTool, project_id=project_id, thread_manager=thread_manager)
     thread_manager.add_tool(MessageTool) # we are just doing this via prompt as there is no need to call it as a tool
-    thread_manager.add_tool(WebSearchTool)
+    thread_manager.add_tool(SandboxWebSearchTool, project_id=project_id, thread_manager=thread_manager)
     thread_manager.add_tool(SandboxVisionTool, project_id=project_id, thread_id=thread_id, thread_manager=thread_manager)
     # Add data providers tool if RapidAPI key is available
     if config.RAPID_API_KEY:
         thread_manager.add_tool(DataProvidersTool)
 
-    system_message = { "role": "system", "content": get_system_prompt() }
+
+    if "gemini-2.5-flash" in model_name.lower():
+        system_message = { "role": "system", "content": get_gemini_system_prompt() } # example included
+    elif "anthropic" not in model_name.lower():
+        # Only include sample response if the model name does not contain "anthropic"
+        sample_response_path = os.path.join(os.path.dirname(__file__), 'sample_responses/1.txt')
+        with open(sample_response_path, 'r') as file:
+            sample_response = file.read()
+        
+        system_message = { "role": "system", "content": get_system_prompt() + "\n\n <sample_assistant_response>" + sample_response + "</sample_assistant_response>" }
+    else:
+        system_message = { "role": "system", "content": get_system_prompt() }
 
     iteration_count = 0
     continue_execution = True
 
+    latest_user_message = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'user').order('created_at', desc=True).limit(1).execute()
+    if latest_user_message.data and len(latest_user_message.data) > 0:
+        data = json.loads(latest_user_message.data[0]['content'])
+        trace.update(input=data['content'])
+
     while continue_execution and iteration_count < max_iterations:
         iteration_count += 1
-        # logger.debug(f"Running iteration {iteration_count}...")
+        logger.info(f"🔄 Running iteration {iteration_count} of {max_iterations}...")
 
         # Billing check on each iteration - still needed within the iterations
         can_run, message, subscription = await check_billing_status(client, account_id)
         if not can_run:
             error_msg = f"Billing limit reached: {message}"
+            trace.event(name="billing_limit_reached", level="ERROR", status_message=(f"{error_msg}"))
             # Yield a special message to indicate billing limit reached
             yield {
                 "type": "status",
@@ -99,7 +123,8 @@ async def run_agent(
         if latest_message.data and len(latest_message.data) > 0:
             message_type = latest_message.data[0].get('type')
             if message_type == 'assistant':
-                print(f"Last message was from assistant, stopping execution")
+                logger.info(f"Last message was from assistant, stopping execution")
+                trace.event(name="last_message_from_assistant", level="INFO", status_message=(f"Last message was from assistant, stopping execution"))
                 continue_execution = False
                 break
 
@@ -113,18 +138,29 @@ async def run_agent(
             try:
                 browser_content = json.loads(latest_browser_state_msg.data[0]["content"])
                 screenshot_base64 = browser_content.get("screenshot_base64")
-                # Create a copy of the browser state without screenshot
+                screenshot_url = browser_content.get("screenshot_url")
+                
+                # Create a copy of the browser state without screenshot data
                 browser_state_text = browser_content.copy()
                 browser_state_text.pop('screenshot_base64', None)
                 browser_state_text.pop('screenshot_url', None)
-                browser_state_text.pop('screenshot_url_base64', None)
 
                 if browser_state_text:
                     temp_message_content_list.append({
                         "type": "text",
                         "text": f"The following is the current state of the browser:\n{json.dumps(browser_state_text, indent=2)}"
                     })
-                if screenshot_base64:
+                    
+                # Prioritize screenshot_url if available
+                if screenshot_url:
+                    temp_message_content_list.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": screenshot_url,
+                        }
+                    })
+                elif screenshot_base64:
+                    # Fallback to base64 if URL not available
                     temp_message_content_list.append({
                         "type": "image_url",
                         "image_url": {
@@ -132,11 +168,11 @@ async def run_agent(
                         }
                     })
                 else:
-                    logger.warning("Browser state found but no screenshot base64 data.")
+                    logger.warning("Browser state found but no screenshot data.")
 
-                await client.table('messages').delete().eq('message_id', latest_browser_state_msg.data[0]["message_id"]).execute()
             except Exception as e:
                 logger.error(f"Error parsing browser state: {e}")
+                trace.event(name="error_parsing_browser_state", level="ERROR", status_message=(f"{e}"))
 
         # Get the latest image_context message (NEW)
         latest_image_context_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'image_context').order('created_at', desc=True).limit(1).execute()
@@ -164,6 +200,7 @@ async def run_agent(
                 await client.table('messages').delete().eq('message_id', latest_image_context_msg.data[0]["message_id"]).execute()
             except Exception as e:
                 logger.error(f"Error parsing image context: {e}")
+                trace.event(name="error_parsing_image_context", level="ERROR", status_message=(f"{e}"))
 
         # If we have any content, construct the temporary_message
         if temp_message_content_list:
@@ -177,106 +214,137 @@ async def run_agent(
             max_tokens = 64000
         elif "gpt-4" in model_name.lower():
             max_tokens = 4096
+            
+        generation = trace.generation(name="thread_manager.run_thread")
+        try:
+            # Make the LLM call and process the response
+            response = await thread_manager.run_thread(
+                thread_id=thread_id,
+                system_prompt=system_message,
+                stream=stream,
+                llm_model=model_name,
+                llm_temperature=0,
+                llm_max_tokens=max_tokens,
+                tool_choice="auto",
+                max_xml_tool_calls=1,
+                temporary_message=temporary_message,
+                processor_config=ProcessorConfig(
+                    xml_tool_calling=True,
+                    native_tool_calling=False,
+                    execute_tools=True,
+                    execute_on_stream=True,
+                    tool_execution_strategy="parallel",
+                    xml_adding_strategy="user_message"
+                ),
+                native_max_auto_continues=native_max_auto_continues,
+                include_xml_examples=True,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                enable_context_manager=enable_context_manager,
+                generation=generation
+            )
 
-        # # Configure tool calling based on model type
-        # use_xml_tool_calling = "anthropic" in model_name.lower() or "claude" in model_name.lower()
-        # use_native_tool_calling = "openai" in model_name.lower() or "gpt" in model_name.lower()
+            if isinstance(response, dict) and "status" in response and response["status"] == "error":
+                logger.error(f"Error response from run_thread: {response.get('message', 'Unknown error')}")
+                trace.event(name="error_response_from_run_thread", level="ERROR", status_message=(f"{response.get('message', 'Unknown error')}"))
+                yield response
+                break
 
-        # # model_name = "openrouter/qwen/qwen3-235b-a22b"
+            # Track if we see ask, complete, or web-browser-takeover tool calls
+            last_tool_call = None
 
-        response = await thread_manager.run_thread(
-            thread_id=thread_id,
-            system_prompt=system_message,
-            stream=stream,
-            llm_model=model_name,
-            llm_temperature=0,
-            llm_max_tokens=max_tokens,
-            tool_choice="auto",
-            max_xml_tool_calls=1,
-            temporary_message=temporary_message,
-            processor_config=ProcessorConfig(
-                xml_tool_calling=True,
-                native_tool_calling=False,
-                execute_tools=True,
-                execute_on_stream=True,
-                tool_execution_strategy="parallel",
-                xml_adding_strategy="user_message"
-            ),
-            native_max_auto_continues=native_max_auto_continues,
-            include_xml_examples=True,
-            enable_thinking=enable_thinking,
-            reasoning_effort=reasoning_effort,
-            enable_context_manager=enable_context_manager
-        )
+            # Process the response
+            error_detected = False
+            try:
+                full_response = ""
+                async for chunk in response:
+                    # If we receive an error chunk, we should stop after this iteration
+                    if isinstance(chunk, dict) and chunk.get('type') == 'status' and chunk.get('status') == 'error':
+                        logger.error(f"Error chunk detected: {chunk.get('message', 'Unknown error')}")
+                        trace.event(name="error_chunk_detected", level="ERROR", status_message=(f"{chunk.get('message', 'Unknown error')}"))
+                        error_detected = True
+                        yield chunk  # Forward the error chunk
+                        continue     # Continue processing other chunks but don't break yet
+                        
+                    # Check for XML versions like <ask>, <complete>, or <web-browser-takeover> in assistant content chunks
+                    if chunk.get('type') == 'assistant' and 'content' in chunk:
+                        try:
+                            # The content field might be a JSON string or object
+                            content = chunk.get('content', '{}')
+                            if isinstance(content, str):
+                                assistant_content_json = json.loads(content)
+                            else:
+                                assistant_content_json = content
 
-        if isinstance(response, dict) and "status" in response and response["status"] == "error":
-            yield response
-            return
+                            # The actual text content is nested within
+                            assistant_text = assistant_content_json.get('content', '')
+                            full_response += assistant_text
+                            if isinstance(assistant_text, str): # Ensure it's a string
+                                 # Check for the closing tags as they signal the end of the tool usage
+                                if '</ask>' in assistant_text or '</complete>' in assistant_text or '</web-browser-takeover>' in assistant_text:
+                                   if '</ask>' in assistant_text:
+                                       xml_tool = 'ask'
+                                   elif '</complete>' in assistant_text:
+                                       xml_tool = 'complete'
+                                   elif '</web-browser-takeover>' in assistant_text:
+                                       xml_tool = 'web-browser-takeover'
 
-        # Track if we see ask, complete, or web-browser-takeover tool calls
-        last_tool_call = None
+                                   last_tool_call = xml_tool
+                                   logger.info(f"Agent used XML tool: {xml_tool}")
+                                   trace.event(name="agent_used_xml_tool", level="INFO", status_message=(f"Agent used XML tool: {xml_tool}"))
+                        except json.JSONDecodeError:
+                            # Handle cases where content might not be valid JSON
+                            logger.warning(f"Warning: Could not parse assistant content JSON: {chunk.get('content')}")
+                            trace.event(name="warning_could_not_parse_assistant_content_json", level="WARNING", status_message=(f"Warning: Could not parse assistant content JSON: {chunk.get('content')}"))
+                        except Exception as e:
+                            logger.error(f"Error processing assistant chunk: {e}")
+                            trace.event(name="error_processing_assistant_chunk", level="ERROR", status_message=(f"Error processing assistant chunk: {e}"))
 
-        async for chunk in response:
-            # print(f"CHUNK: {chunk}") # Uncomment for detailed chunk logging
+                    yield chunk
 
-            # Check for XML versions like <ask>, <complete>, or <web-browser-takeover> in assistant content chunks
-            if chunk.get('type') == 'assistant' and 'content' in chunk:
-                try:
-                    # The content field might be a JSON string or object
-                    content = chunk.get('content', '{}')
-                    if isinstance(content, str):
-                        assistant_content_json = json.loads(content)
-                    else:
-                        assistant_content_json = content
+                # Check if we should stop based on the last tool call or error
+                if error_detected:
+                    logger.info(f"Stopping due to error detected in response")
+                    trace.event(name="stopping_due_to_error_detected_in_response", level="INFO", status_message=(f"Stopping due to error detected in response"))
+                    generation.end(output=full_response, status_message="error_detected", level="ERROR")
+                    break
+                    
+                if last_tool_call in ['ask', 'complete', 'web-browser-takeover']:
+                    logger.info(f"Agent decided to stop with tool: {last_tool_call}")
+                    trace.event(name="agent_decided_to_stop_with_tool", level="INFO", status_message=(f"Agent decided to stop with tool: {last_tool_call}"))
+                    generation.end(output=full_response, status_message="agent_stopped")
+                    continue_execution = False
 
-                    # The actual text content is nested within
-                    assistant_text = assistant_content_json.get('content', '')
-                    if isinstance(assistant_text, str): # Ensure it's a string
-                         # Check for the closing tags as they signal the end of the tool usage
-                        if '</ask>' in assistant_text or '</complete>' in assistant_text or '</web-browser-takeover>' in assistant_text:
-                           if '</ask>' in assistant_text:
-                               xml_tool = 'ask'
-                           elif '</complete>' in assistant_text:
-                               xml_tool = 'complete'
-                           elif '</web-browser-takeover>' in assistant_text:
-                               xml_tool = 'web-browser-takeover'
+            except Exception as e:
+                # Just log the error and re-raise to stop all iterations
+                error_msg = f"Error during response streaming: {str(e)}"
+                logger.error(f"Error: {error_msg}")
+                trace.event(name="error_during_response_streaming", level="ERROR", status_message=(f"Error during response streaming: {str(e)}"))
+                generation.end(output=full_response, status_message=error_msg, level="ERROR")
+                yield {
+                    "type": "status",
+                    "status": "error",
+                    "message": error_msg
+                }
+                # Stop execution immediately on any error
+                break
+                
+        except Exception as e:
+            # Just log the error and re-raise to stop all iterations
+            error_msg = f"Error running thread: {str(e)}"
+            logger.error(f"Error: {error_msg}")
+            trace.event(name="error_running_thread", level="ERROR", status_message=(f"Error running thread: {str(e)}"))
+            yield {
+                "type": "status",
+                "status": "error",
+                "message": error_msg
+            }
+            # Stop execution immediately on any error
+            break
+        generation.end(output=full_response)
 
-                           last_tool_call = xml_tool
-                           print(f"Agent used XML tool: {xml_tool}")
-                except json.JSONDecodeError:
-                    # Handle cases where content might not be valid JSON
-                    print(f"Warning: Could not parse assistant content JSON: {chunk.get('content')}")
-                except Exception as e:
-                    print(f"Error processing assistant chunk: {e}")
-
-            # # Check for native function calls (OpenAI format)
-            # elif chunk.get('type') == 'status' and 'content' in chunk:
-            #     try:
-            #         # Parse the status content
-            #         status_content = chunk.get('content', '{}')
-            #         if isinstance(status_content, str):
-            #             status_content = json.loads(status_content)
-
-            #         # Check if this is a tool call status
-            #         status_type = status_content.get('status_type')
-            #         function_name = status_content.get('function_name', '')
-
-            #         # Check for special function names that should stop execution
-            #         if status_type == 'tool_started' and function_name in ['ask', 'complete', 'web-browser-takeover']:
-            #             last_tool_call = function_name
-            #             print(f"Agent used native function call: {function_name}")
-            #     except json.JSONDecodeError:
-            #         # Handle cases where content might not be valid JSON
-            #         print(f"Warning: Could not parse status content JSON: {chunk.get('content')}")
-            #     except Exception as e:
-            #         print(f"Error processing status chunk: {e}")
-
-            yield chunk
-
-        # Check if we should stop based on the last tool call
-        if last_tool_call in ['ask', 'complete', 'web-browser-takeover']:
-            print(f"Agent decided to stop with tool: {last_tool_call}")
-            continue_execution = False
+    langfuse.flush() # Flush Langfuse events at the end of the run
+  
 
 
 # # TESTING

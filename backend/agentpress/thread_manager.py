@@ -22,6 +22,9 @@ from agentpress.response_processor import (
 )
 from services.supabase import DBConnection
 from utils.logger import logger
+from langfuse.client import StatefulGenerationClient, StatefulTraceClient
+from services.langfuse import langfuse
+import datetime
 
 # Type alias for tool choice
 ToolChoice = Literal["auto", "required", "none"]
@@ -34,15 +37,19 @@ class ThreadManager:
     XML-based tool execution patterns.
     """
 
-    def __init__(self):
+    def __init__(self, trace: Optional[StatefulTraceClient] = None):
         """Initialize ThreadManager.
 
         """
         self.db = DBConnection()
         self.tool_registry = ToolRegistry()
+        self.trace = trace
+        if not self.trace:
+            self.trace = langfuse.trace(name="anonymous:thread_manager")
         self.response_processor = ResponseProcessor(
             tool_registry=self.tool_registry,
-            add_message_callback=self.add_message
+            add_message_callback=self.add_message,
+            trace=self.trace
         )
         self.context_manager = ContextManager()
 
@@ -161,7 +168,8 @@ class ThreadManager:
         include_xml_examples: bool = False,
         enable_thinking: Optional[bool] = False,
         reasoning_effort: Optional[str] = 'low',
-        enable_context_manager: bool = True
+        enable_context_manager: bool = True,
+        generation: Optional[StatefulGenerationClient] = None,
     ) -> Union[Dict[str, Any], AsyncGenerator]:
         """Run a conversation thread with LLM integration and tool execution.
 
@@ -220,6 +228,14 @@ Here are the XML tools available with examples:
                 for tag_name, example in xml_examples.items():
                     examples_content += f"<{tag_name}> Example: {example}\\n"
 
+                # # Save examples content to a file
+                # try:
+                #     with open('xml_examples.txt', 'w') as f:
+                #         f.write(examples_content)
+                #     logger.debug("Saved XML examples to xml_examples.txt")
+                # except Exception as e:
+                #     logger.error(f"Failed to save XML examples to file: {e}")
+
                 system_content = working_system_prompt.get('content')
 
                 if isinstance(system_content, str):
@@ -237,7 +253,6 @@ Here are the XML tools available with examples:
                         logger.warning("System prompt content is a list but no text block found to append XML examples.")
                 else:
                     logger.warning(f"System prompt content is of unexpected type ({type(system_content)}), cannot add XML examples.")
-
         # Control whether we need to auto-continue due to tool_calls finish reason
         auto_continue = True
         auto_continue_count = 0
@@ -315,6 +330,20 @@ Here are the XML tools available with examples:
                 # 5. Make LLM API call
                 logger.debug("Making LLM API call")
                 try:
+                    if generation:
+                        generation.update(
+                            input=prepared_messages,
+                            start_time=datetime.datetime.now(datetime.timezone.utc),
+                            model=llm_model,
+                            model_parameters={
+                              "max_tokens": llm_max_tokens,
+                              "temperature": llm_temperature,
+                              "enable_thinking": enable_thinking,
+                              "reasoning_effort": reasoning_effort,
+                              "tool_choice": tool_choice,
+                              "tools": openapi_tool_schemas,
+                            }
+                        )
                     llm_response = await make_llm_api_call(
                         prepared_messages, # Pass the potentially modified messages
                         llm_model,
@@ -340,28 +369,25 @@ Here are the XML tools available with examples:
                         thread_id=thread_id,
                         config=processor_config,
                         prompt_messages=prepared_messages,
-                        llm_model=llm_model
+                        llm_model=llm_model,
                     )
 
                     return response_generator
                 else:
                     logger.debug("Processing non-streaming response")
-                    try:
-                        # Return the async generator directly, don't await it
-                        response_generator = self.response_processor.process_non_streaming_response(
-                            llm_response=llm_response,
-                            thread_id=thread_id,
-                            config=processor_config,
-                            prompt_messages=prepared_messages,
-                            llm_model=llm_model
-                        )
-                        return response_generator # Return the generator
-                    except Exception as e:
-                        logger.error(f"Error setting up non-streaming response: {str(e)}", exc_info=True)
-                        raise # Re-raise the exception to be caught by the outer handler
+                    # Pass through the response generator without try/except to let errors propagate up
+                    response_generator = self.response_processor.process_non_streaming_response(
+                        llm_response=llm_response,
+                        thread_id=thread_id,
+                        config=processor_config,
+                        prompt_messages=prepared_messages,
+                        llm_model=llm_model,
+                    )
+                    return response_generator # Return the generator
 
             except Exception as e:
                 logger.error(f"Error in run_thread: {str(e)}", exc_info=True)
+                # Return the error as a dict to be handled by the caller
                 return {
                     "status": "error",
                     "message": str(e)
@@ -377,37 +403,58 @@ Here are the XML tools available with examples:
 
                 # Run the thread once, passing the potentially modified system prompt
                 # Pass temp_msg only on the first iteration
-                response_gen = await _run_once(temporary_message if auto_continue_count == 0 else None)
+                try:
+                    response_gen = await _run_once(temporary_message if auto_continue_count == 0 else None)
 
-                # Handle error responses
-                if isinstance(response_gen, dict) and "status" in response_gen and response_gen["status"] == "error":
-                    yield response_gen
-                    return
+                    # Handle error responses
+                    if isinstance(response_gen, dict) and "status" in response_gen and response_gen["status"] == "error":
+                        logger.error(f"Error in auto_continue_wrapper: {response_gen.get('message', 'Unknown error')}")
+                        yield response_gen
+                        return  # Exit the generator on error
 
-                # Process each chunk
-                async for chunk in response_gen:
-                    # Check if this is a finish reason chunk with tool_calls or xml_tool_limit_reached
-                    if chunk.get('type') == 'finish':
-                        if chunk.get('finish_reason') == 'tool_calls':
-                            # Only auto-continue if enabled (max > 0)
-                            if native_max_auto_continues > 0:
-                                logger.info(f"Detected finish_reason='tool_calls', auto-continuing ({auto_continue_count + 1}/{native_max_auto_continues})")
-                                auto_continue = True
-                                auto_continue_count += 1
-                                # Don't yield the finish chunk to avoid confusing the client
-                                continue
-                        elif chunk.get('finish_reason') == 'xml_tool_limit_reached':
-                            # Don't auto-continue if XML tool limit was reached
-                            logger.info(f"Detected finish_reason='xml_tool_limit_reached', stopping auto-continue")
-                            auto_continue = False
-                            # Still yield the chunk to inform the client
+                    # Process each chunk
+                    try:
+                        async for chunk in response_gen:
+                            # Check if this is a finish reason chunk with tool_calls or xml_tool_limit_reached
+                            if chunk.get('type') == 'finish':
+                                if chunk.get('finish_reason') == 'tool_calls':
+                                    # Only auto-continue if enabled (max > 0)
+                                    if native_max_auto_continues > 0:
+                                        logger.info(f"Detected finish_reason='tool_calls', auto-continuing ({auto_continue_count + 1}/{native_max_auto_continues})")
+                                        auto_continue = True
+                                        auto_continue_count += 1
+                                        # Don't yield the finish chunk to avoid confusing the client
+                                        continue
+                                elif chunk.get('finish_reason') == 'xml_tool_limit_reached':
+                                    # Don't auto-continue if XML tool limit was reached
+                                    logger.info(f"Detected finish_reason='xml_tool_limit_reached', stopping auto-continue")
+                                    auto_continue = False
+                                    # Still yield the chunk to inform the client
 
-                    # Otherwise just yield the chunk normally
-                    yield chunk
+                            # Otherwise just yield the chunk normally
+                            yield chunk
 
-                # If not auto-continuing, we're done
-                if not auto_continue:
-                    break
+                        # If not auto-continuing, we're done
+                        if not auto_continue:
+                            break
+                    except Exception as e:
+                        # If there's an exception, log it, yield an error status, and stop execution
+                        logger.error(f"Error in auto_continue_wrapper generator: {str(e)}", exc_info=True)
+                        yield {
+                            "type": "status",
+                            "status": "error",
+                            "message": f"Error in thread processing: {str(e)}"
+                        }
+                        return  # Exit the generator on any error
+                except Exception as outer_e:
+                    # Catch exceptions from _run_once itself
+                    logger.error(f"Error executing thread: {str(outer_e)}", exc_info=True)
+                    yield {
+                        "type": "status",
+                        "status": "error",
+                        "message": f"Error executing thread: {str(outer_e)}"
+                    }
+                    return  # Exit immediately on exception from _run_once
 
             # If we've reached the max auto-continues, log a warning
             if auto_continue and auto_continue_count >= native_max_auto_continues:
